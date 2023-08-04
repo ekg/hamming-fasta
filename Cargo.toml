@@ -7,4 +7,5 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.3.19", features = ["derive"] }
+rayon = "1.7.0"
 rust-htslib = "0.44.1"
