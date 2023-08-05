@@ -29,6 +29,10 @@ struct Args {
     /// Number of threads for parallel execution
     #[arg(short = 't', long, default_value = "0")]
     parallelism: usize,
+
+    /// Flag for the presence of a Cas9 PAM sequence
+    #[arg(short = 'c', long, default_value = "false")]
+    cas9: bool,
 }
 
 fn load_fai(path: &str) -> HashMap<String, usize> {
@@ -53,15 +57,37 @@ fn hamming_distance(s1: &str, s2: &str) -> usize {
     s1.chars().zip(s2.chars()).filter(|&(c1, c2)| c1 != c2).count()
 }
 
-fn search_sequence(fasta: &str, target: &str, prefix: &str, max_mismatches: usize) {
+fn get_reverse_complement(seq: &str) -> String {
+    let mut rev_comp = String::new();
+    for nucleotide in seq.chars().rev() {
+        let complement = match nucleotide {
+            'A' | 'a' => 'T',
+            'T' | 't' => 'A',
+            'G' | 'g' => 'C',
+            'C' | 'c' => 'G',
+            _ => 'N',
+        };
+        rev_comp.push(complement);
+    }
+    rev_comp
+}
+
+fn search_sequence(fasta: &str, target: &str, prefix: &str, max_mismatches: usize, cas9: bool) {
     let reader = Reader::from_path(fasta).unwrap();
     let n_seqs = reader.n_seqs();
     let seq_lengths = load_fai(fasta);
 
     let stdout_lock = Arc::new(Mutex::new(std::io::stdout()));
 
-    // print a header line in tsv
-    println!("seq_name\tstart\tend\tsequence\tmismatches");
+    let mut target = target.to_string();
+    if cas9 {
+        // add the PAM sequence to the target
+        target.push_str("NGG");
+        println!("seq_name\tstrand\tstart\tend\tsequence\tmismatches.nonpam");
+    } else {
+        // print a header line in tsv
+        println!("seq_name\tstrand\tstart\tend\tsequence\tmismatches");
+    }
 
     (0..n_seqs).into_par_iter().for_each(|i| {
         let reader = Reader::from_path(fasta).unwrap(); // Re-create the reader for thread safety
@@ -71,13 +97,27 @@ fn search_sequence(fasta: &str, target: &str, prefix: &str, max_mismatches: usiz
         }
         let seq_length = seq_lengths.get(&seq_name).unwrap();
         let sequence_str = reader.fetch_seq_string(&seq_name, 0, *seq_length).unwrap();
+        let rev_sequence_str = get_reverse_complement(&sequence_str);
 
-        for (idx, window) in sequence_str.as_bytes().windows(target.len()).enumerate() {
-            let window_str = std::str::from_utf8(window).unwrap();
-            let distance = hamming_distance(window_str, target);
-            if distance <= max_mismatches {
-                let mut stdout = stdout_lock.lock().unwrap();
-                writeln!(stdout, "{}\t{}\t{}\t{}\t{}", seq_name, idx, idx + window.len(), window_str, distance).unwrap();
+        for sequence in [(sequence_str, "+"), (rev_sequence_str, "-")].iter() {
+            for (idx, window) in sequence.0.as_bytes().windows(target.len()).enumerate() {
+                let window_str = std::str::from_utf8(window).unwrap();
+                if cas9 && !window_str.ends_with("GG") {
+                    continue;
+                }
+                let mut distance = hamming_distance(window_str, &target);
+                if cas9 {
+                    // because we have N in the query sequence, we need to subtract 1 from the distance
+                    distance -= 1;
+                }
+                if distance <= max_mismatches {
+                    let mut stdout = stdout_lock.lock().unwrap();
+
+                    let start = if sequence.1 == "-" { *seq_length - (idx + window.len()) } else { idx };
+                    let end = if sequence.1 == "-" { *seq_length - idx } else { idx + window.len() };
+
+                    writeln!(stdout, "{}\t{}\t{}\t{}\t{}\t{}", seq_name, sequence.1, start, end, window_str, distance).unwrap();
+                }
             }
         }
     });
@@ -92,6 +132,5 @@ fn main() {
             .build_global()
             .unwrap();
     }
-    search_sequence(&args.fasta, &args.sequence, &args.prefix, args.distance);
-
+    search_sequence(&args.fasta, &args.sequence, &args.prefix, args.distance, args.cas9);
 }
